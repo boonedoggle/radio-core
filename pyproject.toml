@@ -7,8 +7,6 @@ license = "GPL-3.0"
 authors = [
     "Luigi Cruz <@luigifcruz>",
 ]
-
-[project.urls]
 homepage = "https://github.com/luigifcruz/radio-core"
 repository = "https://github.com/luigifcruz/radio-core"
 documentation = "https://luigifcruz.github.io/radio-core/"
