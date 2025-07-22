@@ -1,50 +1,79 @@
+#!/usr/bin/env python3
 import sys
 import time
 import queue
 import sounddevice as sd
 from threading import Thread
 from dataclasses import dataclass
+from argparse import ArgumentParser
 
 from SoapySDR import Device, SOAPY_SDR_CF32, SOAPY_SDR_RX
 from radiocore import Buffer, RingBuffer, FM, MFM, WBFM, Decimate
 
+# =============================================================================
+# Global Defaults
+# =============================================================================
+ENABLE_CUDA: bool = False
+FREQUENCY: float = 94.1e6
+OFFSET_FREQUENCY: float = 312e6
+DEEMPHASIS: float = 75e-6
+CLOCK_RATE: float = 61.44e6
+INPUT_RATE: float = CLOCK_RATE / 32
+DEMOD_RATE: float = 250e3
+AUDIO_RATE: float = 48e3
+DEVICE_NAME: str = "SoapyAIRT"
+DEMODULATOR: str = FM
 
-@dataclass
-class Config:
-    enable_cuda: bool = False       # If True, enable CUDA demodulation.
-    frequency: float = 96.9e6       # Set the FM station frequency.
-    deemphasis: float = 75e-6       # 75e-6 for Americas and Korea, otherwise 50e-6.
-    input_rate: float = 10e6        # SDR RX bandwidth.
-    demod_rate: float = 250e3       # FM station bandwidth. (240-256 kHz).
-    audio_rate: float = 48e3        # Audio bandwidth (32-48 kHz).
-    device_name: str = "airspy"     # SoapySDR device string.
-    demodulator = WBFM              # Demodulator (WBFM, MFM, or FM).
+
+def parse_args():
+    parser = ArgumentParser(description="FM Receiver and Demodulator")
+    parser.add_argument("--enable-cuda", action="store_true",
+                        help="Enable CUDA demodulation")
+    parser.add_argument("--offset-frequency", type=float, default=OFFSET_FREQUENCY,
+                        help=f"Frequency offset if using an upconverter in Hz (default: {OFFSET_FREQUENCY})")
+    parser.add_argument("--frequency", type=float, default=FREQUENCY,
+                        help=f"Set the FM station frequency in Hz (default: {FREQUENCY})")
+    parser.add_argument("--deemphasis", type=float, default=DEEMPHASIS,
+                        help=f"75e-6 for Americas and Korea, otherwise 50e-6 (default: {DEEMPHASIS})")
+    parser.add_argument("--clock-rate", type=float, default=CLOCK_RATE,
+                        help=f"AIR-T master clock rate in Hz (default: {CLOCK_RATE})")
+    parser.add_argument("--input-rate", type=float, default=INPUT_RATE,
+                        help=f"AIR-T sample rate in Hz (default: {INPUT_RATE})")
+    parser.add_argument("--demod-rate", type=float, default=DEMOD_RATE,
+                        help=f"FM station bandwidth. (240-256 kHz) in Hz (default: {DEMOD_RATE})")
+    parser.add_argument("--audio-rate", type=float, default=AUDIO_RATE,
+                        help=f"Audio output sample rate in Hz (default: {AUDIO_RATE})")
+    parser.add_argument("--device-name", type=str, default=DEVICE_NAME,
+                        help=f"Directory to save output files (default: '{DEVICE_NAME}')")
+    parser.add_argument("--demodulator", default=DEMODULATOR,
+                        help=f"Demodulator (WBFM, MFM, or FM) (default: '{DEMODULATOR}')")
+    return parser.parse_args()
 
 
 class SdrDevice(Thread):
-
-    def __init__(self, config: Config):
+    def __init__(self, _config):
         super().__init__()
-        self.config = config
+        self._config = _config
         self.running = False
 
         print("Configuring SDR device...")
-        self.sdr = Device({"driver": self.config.device_name})
-        self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self.config.input_rate)
-        self.sdr.setFrequency(SOAPY_SDR_RX, 0, self.config.frequency)
+        self.sdr = Device({"driver": self._config.device_name,
+                           "master_clock_rate": str(self._config.clock_rate)})
+        self.sdr.setSampleRate(SOAPY_SDR_RX, 0, self._config.input_rate)
+        self.sdr.setFrequency(SOAPY_SDR_RX, 0, self._config.frequency + self._config.offset_frequency)
         self.sdr.setGainMode(SOAPY_SDR_RX, 0, True)
         self.rx = self.sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
 
         print("Allocating SDR device buffers...")
-        self.buffer = RingBuffer(self.config.input_rate * 3,
-                                 cuda=self.config.enable_cuda)
+        self.buffer = RingBuffer(self._config.input_rate * 3,
+                                 cuda=self._config.enable_cuda)
 
     @property
     def output(self) -> RingBuffer:
         return self.buffer
 
     def run(self):
-        tmp_buffer = Buffer(2**16, cuda=self.config.enable_cuda)
+        tmp_buffer = Buffer(2**16, cuda=self._config.enable_cuda)
 
         self.sdr.activateStream(self.rx)
         self.running = True
@@ -66,20 +95,21 @@ class SdrDevice(Thread):
 
 class Dsp(Thread):
 
-    def __init__(self, config: Config, data_in: RingBuffer):
+    def __init__(self, _config, data_in: RingBuffer):
         super().__init__()
-        self.config = config
+        self._config = _config
         self.data_in = data_in
         self.running = False
 
         print("Configuring DSP...")
-        self.demod = self.config.demodulator(self.config.demod_rate,
-                                             self.config.audio_rate,
-                                             deemphasis=self.config.deemphasis,
-                                             cuda=self.config.enable_cuda)
-        self.decim = Decimate(self.config.input_rate,
-                              self.config.demod_rate,
-                              cuda=self.config.enable_cuda)
+        demod = eval(self._config.demodulator)
+        self.demod = demod(self._config.demod_rate,
+                           self._config.audio_rate,
+                           deemphasis=self._config.deemphasis,
+                           cuda=self._config.enable_cuda)
+        self.decim = Decimate(self._config.input_rate,
+                              self._config.demod_rate,
+                              cuda=self._config.enable_cuda)
 
         print("Allocating DSP buffers...")
         self.que = queue.Queue()
@@ -89,7 +119,7 @@ class Dsp(Thread):
         return self.que
 
     def run(self):
-        tmp_buffer = Buffer(self.config.input_rate, cuda=self.config.enable_cuda)
+        tmp_buffer = Buffer(self._config.input_rate, cuda=self._config.enable_cuda)
 
         self.running = True
 
@@ -108,11 +138,7 @@ class Dsp(Thread):
 
 
 if __name__ == "__main__":
-    config = Config()
-
-    # Get frequency from command-line if available.
-    if len(sys.argv) > 1:
-        config.frequency = float(sys.argv[1])
+    config = parse_args()
 
     # Configure SDR device thread.
     rx = SdrDevice(config)
